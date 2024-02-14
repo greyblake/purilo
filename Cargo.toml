@@ -2,6 +2,15 @@
 name = "purilo"
 version = "0.1.0"
 edition = "2021"
+authors = ["Serhii Potapov <blake131313@gmail.com>"]
+description = "CLI tool to find rust projects and clean them up"
+keywords = ["cli"]
+license = "MIT"
+repository = "https://github.com/greyblake/purilo"
+homepage = "https://github.com/greyblake/purilo"
+documentation = "https://docs.rs/purilo"
+readme = "README.md"
+categories = ["cli"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
