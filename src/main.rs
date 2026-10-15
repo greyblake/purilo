@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod claude;
+
 fn main() {
     let output = Command::new("locate")
         .arg("Cargo.lock")
@@ -38,6 +40,7 @@ fn main() {
     }
 
     clean_kache();
+    claude::clean();
 }
 
 
