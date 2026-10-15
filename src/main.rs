@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 mod claude;
+mod node_modules;
+
+// System and package-manager directories with read-only or vendored Rust projects.
+const IGNORED_DIRS: [&str; 3] = ["/nix", "/snap", "/usr"];
 
 fn main() {
     let output = Command::new("locate")
@@ -18,7 +22,7 @@ fn main() {
         .lines()
         .filter(|line| {
             !line.is_empty()
-                && !line.starts_with("/nix")
+                && !IGNORED_DIRS.iter().any(|dir| Path::new(line).starts_with(dir))
                 && !line.contains(".cargo")
                 && !line.contains(".rustup")
         })
@@ -41,6 +45,7 @@ fn main() {
 
     clean_kache();
     claude::clean();
+    node_modules::clean();
 }
 
 
