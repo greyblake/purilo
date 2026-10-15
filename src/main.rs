@@ -1,5 +1,7 @@
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::path::Path;
 
 fn main() {
     let output = Command::new("locate")
@@ -12,7 +14,12 @@ fn main() {
 
     let project_paths: Vec<&Path> =  stdout
         .lines()
-        .filter(|line| !line.is_empty() && !line.contains(".cargo") && !line.contains(".rustup"))
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("/nix")
+                && !line.contains(".cargo")
+                && !line.contains(".rustup")
+        })
         .map(|line| Path::new(line).parent().expect("No parent"))
         .collect();
 
@@ -29,6 +36,8 @@ fn main() {
             println!("Failed to clean {}", project_path.display());
         }
     }
+
+    clean_kache();
 }
 
 
@@ -38,4 +47,37 @@ fn cargo_clean(rust_project_path: &Path) -> Output {
         .current_dir(rust_project_path)
         .output()
         .expect("Failed to run `cargo clean`")
+}
+
+// Removes the local cache of kache (https://github.com/kunobi-ninja/kache).
+// kache recreates it on the next build.
+fn clean_kache() {
+    let Some(kache_dir) = kache_dir() else {
+        return;
+    };
+    if !kache_dir.exists() {
+        return;
+    }
+
+    match fs::remove_dir_all(&kache_dir) {
+        Ok(()) => println!("Cleaned {}", kache_dir.display()),
+        Err(err) => println!("Failed to clean {}: {err}", kache_dir.display()),
+    }
+}
+
+// Resolves the cache directory the same way kache does:
+// $KACHE_CACHE_DIR, then $XDG_CACHE_HOME/kache, then ~/.cache/kache.
+fn kache_dir() -> Option<PathBuf> {
+    if let Some(dir) = non_empty_env("KACHE_CACHE_DIR") {
+        return Some(dir);
+    }
+    let cache_dir = non_empty_env("XDG_CACHE_HOME")
+        .or_else(|| non_empty_env("HOME").map(|home| home.join(".cache")))?;
+    Some(cache_dir.join("kache"))
+}
+
+fn non_empty_env(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
