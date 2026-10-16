@@ -1,6 +1,6 @@
 [package]
 name = "purilo"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Serhii Potapov <blake131313@gmail.com>"]
 description = "CLI tool to find rust projects and clean them up"
