@@ -14,55 +14,111 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
-use crate::non_empty_env;
+use crate::disk_usage::{self, DiskUsage};
+use crate::keep::{INTERRUPTED, MIN_IDLE, NOT_IDLE, keep_reason};
+use crate::progress::Progress;
+use crate::report::{Item, Section};
+use crate::{interrupted, non_empty_env};
 
-const MIN_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+const TITLE: &str = "Claude Code tmp";
 
-pub fn clean() {
+const RUNNING: &str = "running";
+
+pub fn clean(usage: &mut DiskUsage, progress: &Progress) -> Section {
+    let mut section = Section::new(TITLE);
     let Some(config_dir) = config_dir() else {
-        return;
+        return section;
     };
     let Some(user_tmp_dir) = user_tmp_dir(&config_dir) else {
-        return;
+        return section;
     };
     if !user_tmp_dir.exists() {
-        return;
+        return section;
     }
 
-    let running_sessions = match running_session_ids(&config_dir.join("sessions")) {
+    let sessions_dir = config_dir.join("sessions");
+    let running_at_start = match running_session_ids(&sessions_dir) {
         Ok(ids) => ids,
         Err(err) => {
-            println!(
-                "Skipped {}: cannot tell which Claude sessions are running: {err}",
-                user_tmp_dir.display()
-            );
-            return;
+            let reason = format!("cannot tell which Claude sessions are running: {err}");
+            return Section::skipped(TITLE, reason);
         }
     };
 
-    let mut kept_running = 0;
+    let home_slug = non_empty_env("HOME").map(|home| home_slug(&home));
     for session_dir in session_dirs(&user_tmp_dir) {
+        if interrupted() {
+            section.interrupted = true;
+            break;
+        }
+        let label = session_label(&session_dir, home_slug.as_deref());
+        progress.set(TITLE, &label);
         let session_id = session_dir
             .file_name()
             .unwrap_or_default()
-            .to_string_lossy();
-        if running_sessions.contains(session_id.as_ref()) {
-            kept_running += 1;
-            continue;
-        }
-        if !is_idle(&session_dir) {
-            continue;
+            .to_string_lossy()
+            .into_owned();
+
+        // Measured before the checks, so they run right before the removal. The registry is
+        // read again in case the session was resumed since the section started.
+        let before = usage.measure(&session_dir);
+        let keep = keep_reason(
+            RUNNING,
+            running_at_start.contains(&session_id),
+            || is_idle(&session_dir).map(|idle| (!idle).then_some(NOT_IDLE)),
+            || running_session_ids(&sessions_dir).map(|ids| ids.contains(&session_id)),
+        );
+        if keep.is_none() && interrupted() {
+            section
+                .items
+                .push(Item::kept(label, INTERRUPTED, before.total()));
+            section.interrupted = true;
+            break;
         }
 
-        match fs::remove_dir_all(&session_dir) {
-            Ok(()) => println!("Cleaned {}", session_dir.display()),
-            Err(err) => println!("Failed to clean {}: {err}", session_dir.display()),
-        }
+        let item = match keep {
+            Some(reason) => Item::kept(label, reason, before.total()),
+            None => {
+                let removal = usage.remove(&session_dir, before, disk_usage::remove_dir_all);
+                Item::removed(label, removal)
+            }
+        };
+        section.items.push(item);
     }
+    section
+}
 
-    if kept_running > 0 {
-        println!("Kept {kept_running} Claude session directories in use by running sessions");
-    }
+fn home_slug(home: &Path) -> String {
+    slug(home.to_string_lossy().trim_end_matches('/'))
+}
+
+// "<project> · <session id prefix>". The project directory is named after the session's
+// working directory, with every non-alphanumeric character replaced by '-'. That is lossy,
+// so this is only a label; the $HOME part of it is dropped.
+fn session_label(session_dir: &Path, home_slug: Option<&str>) -> String {
+    let name = |path: Option<&Path>| {
+        path.and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let session_id = name(Some(session_dir));
+    let project_slug = name(session_dir.parent());
+    let project = match home_slug {
+        Some(home_slug) if project_slug == home_slug => "~",
+        Some(home_slug) => project_slug
+            .strip_prefix(home_slug)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .unwrap_or(&project_slug),
+        None => &project_slug,
+    };
+    let short_id: String = session_id.chars().take(8).collect();
+    format!("{project} · {short_id}")
+}
+
+fn slug(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -181,14 +237,13 @@ fn is_uuid(name: &str) -> bool {
         })
 }
 
-// Whether nothing in the directory changed for MIN_IDLE.
-// Anything that can't be checked counts as recently changed.
-fn is_idle(dir: &Path) -> bool {
-    let Ok(cutoff) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
-        return false;
-    };
-    let cutoff = cutoff.saturating_sub(MIN_IDLE);
-    newest_mtime(dir).is_ok_and(|mtime| mtime < cutoff)
+// Whether nothing in the directory changed for MIN_IDLE; an error when something in it
+// can't be checked.
+fn is_idle(dir: &Path) -> io::Result<bool> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok(newest_mtime(dir)? < now.saturating_sub(MIN_IDLE))
 }
 
 // Newest modification time in the tree, as a duration since the Unix epoch.
@@ -204,4 +259,37 @@ fn newest_mtime(path: &Path) -> io::Result<Duration> {
         }
     }
     Ok(newest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SESSION: &str = "54ce425c-e0ca-4a9a-8a66-ed89089141a5";
+
+    fn label(project_slug: &str, home_slug: Option<&str>) -> String {
+        let dir = Path::new("/tmp/claude-1000")
+            .join(project_slug)
+            .join(SESSION);
+        session_label(&dir, home_slug)
+    }
+
+    #[test]
+    fn labels_sessions_by_project_without_home() {
+        let home = slug("/home/me");
+        assert_eq!(home, "-home-me");
+        assert_eq!(label("-home-me-dev-x", Some(&home)), "dev-x · 54ce425c");
+        assert_eq!(label("-home-me", Some(&home)), "~ · 54ce425c");
+        assert_eq!(
+            label("-home-meow-x", Some(&home)),
+            "-home-meow-x · 54ce425c"
+        );
+        assert_eq!(label("-srv-x", None), "-srv-x · 54ce425c");
+    }
+
+    #[test]
+    fn ignores_a_trailing_slash_in_home() {
+        assert_eq!(home_slug(Path::new("/home/me/")), "-home-me");
+        assert_eq!(home_slug(Path::new("/home/me")), "-home-me");
+    }
 }
